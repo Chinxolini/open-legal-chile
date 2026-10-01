@@ -147,7 +147,15 @@
       "properties": {
         "query": {
           "type": "string",
-          "description": "Término de búsqueda jurídica (ej. 'confianza legitima contrata', 'probidad')"
+          "description": "Término de búsqueda jurídica (ej. 'confianza legitima contrata', 'probidad', 'ley 21.180'). Los números de ley se consultan con y sin punto de miles."
+        },
+        "todas_las_paginas": {
+          "type": "boolean",
+          "description": "Recorre todas las páginas de la CGR (20 por página, hasta 10 por variante) en vez de solo la primera. Más lento."
+        },
+        "limit": {
+          "type": "integer",
+          "description": "Máximo de documentos a reunir (opcional)"
         }
       },
       "required": [
@@ -164,6 +172,14 @@
         "query": {
           "type": "string",
           "description": "Entidad o materia auditada (ej. 'Municipalidad de Santiago', 'Hospital')"
+        },
+        "todas_las_paginas": {
+          "type": "boolean",
+          "description": "Recorre todas las páginas de la CGR (20 por página, hasta 10 por variante) en vez de solo la primera. Más lento."
+        },
+        "limit": {
+          "type": "integer",
+          "description": "Máximo de documentos a reunir (opcional)"
         }
       },
       "required": [

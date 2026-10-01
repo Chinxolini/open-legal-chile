@@ -70,3 +70,48 @@ def test_auditorias_identificador_citable():
     assert any("/" in item["docId"] for item in res["resultados"]), (
         "ningún informe trae identificador con año; se perdió la referencia citable"
     )
+
+
+# ── Normalizacion de numeros de ley y barrido de paginas (en vivo) ───────────────────────────
+
+def test_numero_de_ley_con_y_sin_punto_se_unen():
+    """'21.180' y '21180' traen universos distintos en la CGR; la consulta debe traer ambos."""
+    try:
+        solo = CGRClient().search_jurisprudencia("21.180", normalizar_numeros=False, use_cache=False)
+        unida = CGRClient().search_jurisprudencia("21.180", use_cache=False)
+    except NETWORK_ERRORS as e:
+        pytest.skip(f"Portal CGR no disponible temporalmente: {e}")
+    if not solo["resultados"]:
+        pytest.skip("consulta de control sin resultados")
+    ids = [r["docId"] for r in unida["resultados"]]
+    assert len(ids) == len(set(ids)), "documentos repetidos en la union"
+    assert ids[:len(solo["resultados"])] == [r["docId"] for r in solo["resultados"]], (
+        "la union debe conservar primero el orden de la consulta original"
+    )
+    assert unida["variantes"] == ["21.180", "21180"]
+    assert "021180N84" not in ids, "el correlativo 021180 no es la Ley 21.180"
+
+
+def test_barrido_trae_todo_el_universo():
+    """'21.180' tiene mas de 20 dictamenes: el barrido cruza la primera pagina y cierra."""
+    try:
+        res = CGRClient().search_jurisprudencia("21.180", todas_las_paginas=True, use_cache=False)
+    except NETWORK_ERRORS as e:
+        pytest.skip(f"Portal CGR no disponible temporalmente: {e}")
+    if res.get("advertencias"):
+        pytest.skip(f"barrido interrumpido por el portal: {res['advertencias']}")
+    ids = [r["docId"] for r in res["resultados"]]
+    assert res["barrido_completo"] is True
+    assert len(ids) > 20 and len(ids) == len(set(ids)) == res["total"]
+    assert len(ids) >= max(res["totales_por_variante"].values())
+
+
+def test_barrido_respeta_limit():
+    try:
+        res = CGRClient().search_jurisprudencia("probidad", todas_las_paginas=True, limit=25, use_cache=False)
+    except NETWORK_ERRORS as e:
+        pytest.skip(f"Portal CGR no disponible temporalmente: {e}")
+    if res.get("advertencias"):
+        pytest.skip(f"barrido interrumpido por el portal: {res['advertencias']}")
+    ids = [r["docId"] for r in res["resultados"]]
+    assert len(ids) == 25 == len(set(ids)) and res["paginas_consultadas"] == 2

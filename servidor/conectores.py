@@ -95,7 +95,9 @@ TOOLS = [
         "inputSchema": {
             "type": "object",
             "properties": {
-                "query": {"type": "string", "description": "Término de búsqueda jurídica (ej. 'confianza legitima contrata', 'probidad')"}
+                "query": {"type": "string", "description": "Término de búsqueda jurídica (ej. 'confianza legitima contrata', 'probidad', 'ley 21.180'). Los números de ley se consultan con y sin punto de miles."},
+                "todas_las_paginas": {"type": "boolean", "description": "Recorre todas las páginas de la CGR (20 por página, hasta 10 por variante) en vez de solo la primera. Más lento."},
+                "limit": {"type": "integer", "description": "Máximo de documentos a reunir (opcional)"}
             },
             "required": ["query"]
         }
@@ -106,7 +108,9 @@ TOOLS = [
         "inputSchema": {
             "type": "object",
             "properties": {
-                "query": {"type": "string", "description": "Entidad o materia auditada (ej. 'Municipalidad de Santiago', 'Hospital')"}
+                "query": {"type": "string", "description": "Entidad o materia auditada (ej. 'Municipalidad de Santiago', 'Hospital')"},
+                "todas_las_paginas": {"type": "boolean", "description": "Recorre todas las páginas de la CGR (20 por página, hasta 10 por variante) en vez de solo la primera. Más lento."},
+                "limit": {"type": "integer", "description": "Máximo de documentos a reunir (opcional)"}
             },
             "required": ["query"]
         }
@@ -352,6 +356,16 @@ TOOLS = [
 ]
 
 
+def _opciones_cgr(args: dict) -> dict:
+    """Solo las opciones de barrido que vinieron: sin ellas la llamada al conector es la de siempre."""
+    opciones: dict = {}
+    if args.get("todas_las_paginas"):
+        opciones["todas_las_paginas"] = True
+    if args.get("limit"):
+        opciones["limit"] = int(args["limit"])
+    return opciones
+
+
 def despachar(name: str, args: dict) -> Any:
     _refrescar()
     if name == "bcn_get_codigo":
@@ -392,10 +406,10 @@ def despachar(name: str, args: dict) -> Any:
             return {"error": "Los parámetros 'codigo' y 'fecha' (YYYY-MM-DD) son obligatorios."}
         return bcn.get_codigo_historico(cod, fecha, args.get("articulo"))
     elif name == "cgr_search_jurisprudencia":
-        return _citas_en_items(cgr.search_jurisprudencia(args.get("query", "")), "CGR",
+        return _citas_en_items(cgr.search_jurisprudencia(args.get("query", ""), **_opciones_cgr(args)), "CGR",
                                campos_clave=("nombre", "anio"), campo_texto="texto")
     elif name == "cgr_search_auditorias":
-        return cgr.search_auditorias(args.get("query", ""))
+        return cgr.search_auditorias(args.get("query", ""), **_opciones_cgr(args))
     elif name == "dt_search_doctrina":
         return _citas_en_items(dt.search_dictamenes(args.get("query", ""), limit=10), "Dictamen DT",
                                campos_clave=("titulo", "fecha"), campo_texto="materia")
