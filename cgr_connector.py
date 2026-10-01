@@ -9,6 +9,8 @@ import sys
 import json
 import re
 import time
+import logging
+import urllib.error
 import urllib.request
 import urllib.parse
 from typing import Any, Callable, Dict, List, Optional, Set, Tuple
@@ -18,9 +20,29 @@ BASE_URL = "https://www.contraloria.cl/apibusca"
 CACHE_DIR = os.path.join(os.path.dirname(__file__), "cgr_cache")
 _TTL_CACHE_SEGUNDOS = 30 * 24 * 60 * 60  # la jurisprudencia de la CGR cambia lento: un mes
 _TAMANO_PAGINA = 20          # la API entrega 20 documentos por pagina y no deja cambiarlo
-_MAX_PAGINAS_DEFECTO = 10    # barrido: hasta 200 documentos por variante de la consulta
+_MAX_PAGINAS_DEFECTO = 10    # barrido pedido: hasta 200 documentos por variante de la consulta
 _TECHO_PAGINAS = 50          # tope duro aunque se pida mas (la API corta en from+size = 10.000)
-_PAUSA_ENTRE_PAGINAS = 0.5   # segundos entre llamadas de red consecutivas: no cargar el portal
+_UMBRAL_BARRIDO_AUTOMATICO = 100  # por defecto se trae el universo entero si no pasa de 5 paginas
+_PAGINAS_RECUPERACION = 6    # paginas que se repiten si el orden inestable dejo documentos fuera
+
+# Ritmo y reintentos, medidos contra la API el 01-10-2026 (mediciones/ fuera del repo): ver PR.
+_PAUSA_ENTRE_PAGINAS = 1.0   # segundos entre llamadas de red consecutivas de un barrido
+_PAUSA_MAXIMA = 8.0          # tras cada bloqueo la pausa se duplica hasta este techo
+_STATUS_REINTENTABLES = frozenset({429, 500, 502, 503, 504})
+_REINTENTOS_HTTP = 3         # 429/5xx: esperas de 2, 4 y 8 s (o el Retry-After, hasta 60 s)
+_REINTENTOS_RED = 1          # timeout o caida de red: un reintento (cada intento puede tardar 30 s)
+_BACKOFF_BASE = 2.0
+_BACKOFF_TECHO = 60.0
+_MAX_REGISTRO_BLOQUEOS = 100
+
+_log = logging.getLogger("openlegal.cgr")
+
+
+def _espera_backoff(intento: int, retry_after: Optional[str] = None) -> float:
+    """Espera antes del reintento ``intento`` (1, 2, 3...): exponencial, o el Retry-After del portal."""
+    if retry_after and retry_after.strip().isdigit():
+        return min(float(retry_after.strip()), _BACKOFF_TECHO)
+    return min(_BACKOFF_BASE ** intento, _BACKOFF_TECHO)
 
 # --- Normalizacion de numeros de ley ------------------------------------------------------------
 # El indice de la CGR trata "21180" y "21.180" como terminos distintos: la misma consulta trae
@@ -153,9 +175,12 @@ class _Barrido:
     advertencias y la pausa entre llamadas de red."""
 
     def __init__(self, cliente: "CGRClient", source: str, exact: bool, use_cache: bool,
-                 tope: int, limite: Optional[int]):
+                 tope: int, limite: Optional[int], umbral_automatico: Optional[int] = None):
         self.cliente, self.source, self.exact, self.use_cache = cliente, source, exact, use_cache
-        self.tope, self.limite = tope, limite
+        self.tope, self.limite, self.umbral_automatico = tope, limite, umbral_automatico
+        self.pausa = _PAUSA_ENTRE_PAGINAS
+        self.semilla: Optional[Dict[str, Any]] = None  # pagina 0 ya obtenida de la primera variante
+        self.reintentos: List[Dict[str, Any]] = []
         self.unidos: List[Dict[str, Any]] = []
         self.vistos: Set[str] = set()
         self.totales: Dict[str, int] = {}
@@ -167,44 +192,125 @@ class _Barrido:
     def lleno(self) -> bool:
         return bool(self.limite) and len(self.unidos) >= (self.limite or 0)
 
-    def _pedir(self, variante: str, pagina: int) -> Optional[Dict[str, Any]]:
+    def _pedir(self, variante: str, pagina: int, forzar_red: bool = False) -> Optional[Dict[str, Any]]:
+        if self.semilla is not None:
+            datos, self.semilla, self.hubo_red = self.semilla, None, True
+            self.paginas += 1
+            self.totales.setdefault(variante, int(datos.get("total") or 0))
+            return datos
         if self.hubo_red:
-            time.sleep(_PAUSA_ENTRE_PAGINAS)
+            time.sleep(self.pausa)
+        antes = len(self.cliente.bloqueos)
         try:
-            datos, self.hubo_red = self.cliente._buscar_pagina(variante, self.source, pagina,
-                                                               self.exact, self.use_cache)
+            datos, self.hubo_red = self.cliente._buscar_pagina(variante, self.source, pagina, self.exact,
+                                                               self.use_cache and not forzar_red)
         except Exception as e:  # noqa: BLE001 — se informa y se conserva lo reunido
             if self.paginas == 0:
                 raise  # sin nada reunido, el error es la respuesta (como antes)
             self.advertencias.append(f"'{variante}' página {pagina}: {e}")
             self.completo, self.hubo_red = False, True
             return None
+        finally:
+            nuevos = self.cliente.bloqueos[antes:]
+            if nuevos:
+                # El portal pidio aire: se baja el ritmo para el resto del barrido.
+                self.reintentos.extend(nuevos)
+                self.pausa = min(self.pausa * 2, _PAUSA_MAXIMA)
         self.paginas += 1
         if datos.get("copia_local_vencida"):
             self.advertencias.append(f"'{variante}' página {pagina}: copia local vencida, portal no disponible")
         self.totales.setdefault(variante, int(datos.get("total") or 0))
         return datos
 
+    def ejecutar(self, query: str, variantes: List[str], page: int, forzar_detalle: bool) -> Dict[str, Any]:
+        """Barre cada variante (la primera sin filtro, las demas solo si mencionan la ley) y arma la salida."""
+        numeros = [d for _, _, d in _numeros_de_ley(query)]
+        for indice, variante in enumerate(variantes):
+            if self.lleno():
+                self.completo = False
+                break
+            self.barrer(variante, page, (lambda it: True) if indice == 0 else
+                        (lambda it: _cita_alguna_ley(it, numeros)))
+        salida: Dict[str, Any] = {
+            "query": query,
+            "source": self.source,
+            # Exacto si se leyo todo; si no, el mayor total informado (cota inferior de la union).
+            "total": len(self.unidos) if self.completo else max(self.totales.values(), default=0),
+            "page": page,
+            "resultados": self.unidos[:self.limite] if self.limite else self.unidos,
+        }
+        if len(variantes) > 1:
+            salida["variantes"] = variantes
+            salida["totales_por_variante"] = self.totales
+        if forzar_detalle or self.paginas > len(variantes):
+            salida["paginas_consultadas"] = self.paginas
+            salida["barrido_completo"] = self.completo
+        for clave, valor in (("advertencias", self.advertencias), ("reintentos", self.reintentos)):
+            if valor:
+                salida[clave] = valor
+        return salida
+
+    def _incorporar(self, items: List[Dict[str, Any]], vistos_variante: Set[str],
+                    admitir: Callable[[Dict[str, Any]], bool]) -> int:
+        """Agrega lo nuevo de una pagina; devuelve cuantos documentos ya se habian visto."""
+        repetidos = 0
+        for it in items:
+            if it["docId"] in vistos_variante:
+                repetidos += 1
+                continue
+            vistos_variante.add(it["docId"])
+            if it["docId"] not in self.vistos and admitir(it):
+                self.vistos.add(it["docId"])
+                self.unidos.append(it)
+        return repetidos
+
+    def _recuperar(self, variante: str, con_repetidos: List[int], vistos_variante: Set[str],
+                   admitir: Callable[[Dict[str, Any]], bool]) -> None:
+        """Vuelve a pedir, sin cache, las paginas donde hubo repetidos y la anterior a cada una.
+
+        Medido el 01-10-2026: el indice ordena por (fecha, puntaje) y el puntaje varia entre
+        peticiones, asi que documentos de la misma fecha cambian de pagina entre una llamada y otra:
+        uno aparece dos veces y otro ninguna ("probidad": 2 de 3.080; "sumario administrativo":
+        4 de 8.051). Repetir la frontera suele traer al que falto."""
+        paginas = sorted({q for p in con_repetidos for q in (p - 1, p) if q >= 0})[:_PAGINAS_RECUPERACION]
+        for pagina in paginas:
+            if len(vistos_variante) >= self.totales[variante]:
+                return
+            datos = self._pedir(variante, pagina, forzar_red=True)
+            if datos is None:
+                return
+            self._incorporar(datos.get("resultados", []), vistos_variante, admitir)
+
     def barrer(self, variante: str, desde: int, admitir: Callable[[Dict[str, Any]], bool]) -> None:
         """Recorre las paginas de una variante y agrega a la union lo nuevo que ``admitir`` acepte."""
         vistos_variante: Set[str] = set()
+        repetidos, con_repetidos = 0, []
         for pagina in range(desde, desde + self.tope):
             datos = self._pedir(variante, pagina)
             if datos is None:
                 return
             items = datos.get("resultados", [])
-            nuevos = [it for it in items if it["docId"] not in vistos_variante]
-            if items and not nuevos:
+            if items and all(it["docId"] in vistos_variante for it in items):
                 self.advertencias.append(
                     f"'{variante}' página {pagina}: la API repitió documentos ya vistos; barrido detenido")
                 self.completo = False
                 return
-            for it in nuevos:
-                vistos_variante.add(it["docId"])
-                if it["docId"] not in self.vistos and admitir(it):
-                    self.vistos.add(it["docId"])
-                    self.unidos.append(it)
+            ya_vistos = self._incorporar(items, vistos_variante, admitir)
+            if ya_vistos:
+                repetidos += ya_vistos
+                con_repetidos.append(pagina)
             if len(items) < _TAMANO_PAGINA or len(vistos_variante) >= self.totales[variante]:
+                if desde == 0 and con_repetidos and len(vistos_variante) < self.totales[variante]:
+                    self._recuperar(variante, con_repetidos, vistos_variante, admitir)
+                faltan = self.totales[variante] - len(vistos_variante) if desde == 0 else 0
+                if faltan > 0:
+                    self.advertencias.append(
+                        f"'{variante}': la API repitió {repetidos} documento(s) entre páginas y faltan "
+                        f"{faltan} de {self.totales[variante]} (orden inestable entre documentos de la misma fecha)")
+                    self.completo = False
+                return
+            if self.umbral_automatico is not None and self.totales[variante] > self.umbral_automatico:
+                self.completo = False  # universo grande: solo la primera pagina, salvo que se pida
                 return
             if self.lleno():
                 self.completo = False
@@ -216,6 +322,38 @@ class CGRClient:
     def __init__(self, cache_dir: str = CACHE_DIR):
         self.cache_dir = cache_dir
         os.makedirs(self.cache_dir, exist_ok=True)
+        # Registro de reintentos (429, 5xx, timeouts) del cliente, el mas reciente al final.
+        self.bloqueos: List[Dict[str, Any]] = []
+
+    def _registrar_bloqueo(self, query: str, page: int, motivo: str, intento: int, espera: float) -> None:
+        evento = {"ts": time.strftime("%Y-%m-%dT%H:%M:%S"), "consulta": query, "pagina": page,
+                  "motivo": motivo, "intento": intento, "espera_s": espera}
+        self.bloqueos.append(evento)
+        del self.bloqueos[:-_MAX_REGISTRO_BLOQUEOS]
+        _log.warning("CGR: %s en '%s' pagina %s; reintento %s en %.0f s", motivo, query, page, intento, espera)
+
+    def _pedir_con_backoff(self, req: urllib.request.Request, query: str, page: int) -> str:
+        """Hace la peticion con backoff exponencial ante 429, 5xx y fallas de red.
+
+        Agotados los reintentos se propaga el ultimo error, como antes (y ``_buscar_pagina``
+        recurre a la copia local vencida si la hay)."""
+        intento = 0
+        while True:
+            try:
+                with safe_urlopen(req, timeout=30) as resp:
+                    return resp.read().decode("utf-8", errors="ignore")
+            except urllib.error.HTTPError as e:
+                if e.code not in _STATUS_REINTENTABLES or intento >= _REINTENTOS_HTTP:
+                    raise
+                motivo, retry_after = f"HTTP {e.code}", (e.headers.get("Retry-After") if e.headers else None)
+            except (urllib.error.URLError, TimeoutError, ConnectionError) as e:
+                if intento >= _REINTENTOS_RED:
+                    raise
+                motivo, retry_after = type(e).__name__, None
+            intento += 1
+            espera = _espera_backoff(intento, retry_after)
+            self._registrar_bloqueo(query, page, motivo, intento, espera)
+            time.sleep(espera)
 
     def _get_cache_path(self, key: str) -> str:
         return os.path.join(self.cache_dir, f"{key}.json")
@@ -261,8 +399,7 @@ class CGRClient:
         )
 
         try:
-            with safe_urlopen(req, timeout=30) as resp:
-                raw = resp.read().decode("utf-8", errors="ignore")
+            raw = self._pedir_con_backoff(req, query, page)
         except Exception:
             if data is not None:
                 return {**data, "copia_local_vencida": True}, True
@@ -295,12 +432,13 @@ class CGRClient:
 
     def search_jurisprudencia(self, query: str, source: str = "dictamenes", page: int = 0, exact: bool = False,
                               use_cache: bool = True, normalizar_numeros: bool = True,
-                              todas_las_paginas: bool = False, max_paginas: int = _MAX_PAGINAS_DEFECTO,
+                              todas_las_paginas: Optional[bool] = None, max_paginas: int = _MAX_PAGINAS_DEFECTO,
                               limit: Optional[int] = None) -> Dict[str, Any]:
         """Busca en el Sistema de Jurisprudencia de la Contraloría General de la República.
 
-        Sin numeros de ley en la consulta, sin ``todas_las_paginas`` y sin ``limit``, la respuesta es
-        la de una pagina de la API, igual que antes.
+        Por defecto (``todas_las_paginas=None``) el barrido es automatico y acotado: si el universo de
+        la consulta no pasa de 100 documentos (5 paginas) se trae entero; si es mayor, solo la primera
+        pagina, igual que antes. Una consulta de hasta 20 documentos responde exactamente como antes.
 
         ``normalizar_numeros`` (activo por defecto; no aplica con ``exact``): si la consulta trae un
         numero de ley ("21180", "21.180", "Ley N° 21.180"; criterio en ``_numeros_de_ley``), se
@@ -308,45 +446,36 @@ class CGRClient:
         primero los de la consulta tal como vino, en el orden de la API; despues los nuevos de cada
         variante, y solo si mencionan la ley en su contenido (``_cita_alguna_ley``).
 
-        ``todas_las_paginas`` (opt-in: multiplica las llamadas a la API) recorre desde ``page`` hasta
-        recibir menos de 20 documentos, completar el ``total`` informado, agotar ``max_paginas`` por
-        variante (techo 50) o reunir ``limit`` documentos. Una pagina que solo repite documentos ya
-        vistos corta el barrido. Un error despues de la primera pagina no descarta lo reunido: queda
+        ``todas_las_paginas=True`` recorre aunque el universo sea grande; ``False`` pide una sola pagina.
+        El barrido avanza desde ``page`` hasta recibir menos de 20 documentos, completar el ``total``
+        informado, agotar ``max_paginas`` por variante (techo 50) o reunir ``limit`` documentos. Una pagina que solo repite documentos ya
+        vistos corta el barrido; si al final faltan documentos por el orden inestable del indice, se
+        repiten las paginas fronterizas (``_recuperar``) y lo que siga faltando se avisa. Un error despues de la primera pagina no descarta lo reunido: queda
         en ``advertencias`` y ``barrido_completo`` en falso. ``total`` es exacto solo con barrido
-        completo; si no, es el mayor ``total`` informado por la API entre las variantes.
+        completo; si no, es el mayor ``total`` informado por la API entre las variantes. Entre paginas
+        hay 1 s de pausa; ante 429/5xx/timeout se reintenta con backoff exponencial, la pausa se
+        duplica y los reintentos quedan en ``reintentos`` (y en ``self.bloqueos``).
         """
         variantes = _variantes_consulta(query) if (normalizar_numeros and not exact) else [query]
         limite = limit if limit and limit > 0 else None
-        if len(variantes) == 1 and not todas_las_paginas and not limite:
-            return self._buscar_pagina(query, source, page, exact, use_cache)[0]
+        automatico = todas_las_paginas is None and page == 0
+        if len(variantes) == 1 and not limite:
+            if not todas_las_paginas and not automatico:
+                return self._buscar_pagina(query, source, page, exact, use_cache)[0]
+            if automatico:
+                primera = self._buscar_pagina(query, source, page, exact, use_cache)[0]
+                if not _TAMANO_PAGINA < int(primera.get("total") or 0) <= _UMBRAL_BARRIDO_AUTOMATICO:
+                    return primera  # cabe en una pagina o es un universo grande: como antes
 
-        tope = max(1, min(int(max_paginas), _TECHO_PAGINAS)) if todas_las_paginas else 1
-        numeros = [d for _, _, d in _numeros_de_ley(query)]
-        barrido = _Barrido(self, source, exact, use_cache, tope, limite)
-        for indice, variante in enumerate(variantes):
-            if barrido.lleno():
-                barrido.completo = False
-                break
-            barrido.barrer(variante, page, (lambda it: True) if indice == 0 else
-                           (lambda it: _cita_alguna_ley(it, numeros)))
-
-        salida: Dict[str, Any] = {
-            "query": query,
-            "source": source,
-            "total": (len(barrido.unidos) if (todas_las_paginas and barrido.completo)
-                      else max(barrido.totales.values(), default=0)),
-            "page": page,
-            "resultados": barrido.unidos[:limite] if limite else barrido.unidos,
-        }
-        if len(variantes) > 1:
-            salida["variantes"] = variantes
-            salida["totales_por_variante"] = barrido.totales
         if todas_las_paginas:
-            salida["paginas_consultadas"] = barrido.paginas
-            salida["barrido_completo"] = barrido.completo
-        if barrido.advertencias:
-            salida["advertencias"] = barrido.advertencias
-        return salida
+            tope = max(1, min(int(max_paginas), _TECHO_PAGINAS))
+        else:
+            tope = -(-_UMBRAL_BARRIDO_AUTOMATICO // _TAMANO_PAGINA) if automatico else 1
+        barrido = _Barrido(self, source, exact, use_cache, tope, limite,
+                           _UMBRAL_BARRIDO_AUTOMATICO if automatico else None)
+        if len(variantes) == 1 and automatico and not limite:
+            barrido.semilla = primera  # la pagina 0 ya se pidio: no se vuelve a pedir
+        return barrido.ejecutar(query, variantes, page, forzar_detalle=bool(todas_las_paginas))
 
     def get_dictamen(self, doc_id: str) -> Dict[str, Any]:
         """Obtiene un dictamen por su código oficial, validando el identificador.

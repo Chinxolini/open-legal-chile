@@ -78,7 +78,8 @@ def test_numero_de_ley_con_y_sin_punto_se_unen():
     """'21.180' y '21180' traen universos distintos en la CGR; la consulta debe traer ambos."""
     try:
         solo = CGRClient().search_jurisprudencia("21.180", normalizar_numeros=False, use_cache=False)
-        unida = CGRClient().search_jurisprudencia("21.180", use_cache=False)
+        # misma cache: entre peticiones la API puede reordenar documentos de la misma fecha
+        unida = CGRClient().search_jurisprudencia("21.180")
     except NETWORK_ERRORS as e:
         pytest.skip(f"Portal CGR no disponible temporalmente: {e}")
     if not solo["resultados"]:
@@ -90,6 +91,7 @@ def test_numero_de_ley_con_y_sin_punto_se_unen():
     )
     assert unida["variantes"] == ["21.180", "21180"]
     assert "021180N84" not in ids, "el correlativo 021180 no es la Ley 21.180"
+    assert len(ids) > 20, "por defecto, un universo de menos de 100 se trae entero"
 
 
 def test_barrido_trae_todo_el_universo():

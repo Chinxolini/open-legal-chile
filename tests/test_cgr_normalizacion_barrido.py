@@ -27,8 +27,9 @@ def _cita(doc_id):
 class _PortalFalso:
     """Sirve {(consulta, pagina): [hits] | Exception} y registra cada llamada."""
 
-    def __init__(self, paginas, totales=None, por_defecto=None):
+    def __init__(self, paginas, totales=None, por_defecto=None, secuencias=None):
         self.paginas = paginas
+        self.secuencias = {k: list(v) for k, v in (secuencias or {}).items()}  # fallas antes de responder
         self.totales = totales or {}
         self.por_defecto = por_defecto
         self.llamadas = []
@@ -37,6 +38,8 @@ class _PortalFalso:
         cuerpo = json.loads(req.data.decode("utf-8"))
         clave = (cuerpo["search"], cuerpo["page"])
         self.llamadas.append(clave)
+        if self.secuencias.get(clave):
+            raise self.secuencias[clave].pop(0)
         pagina = self.paginas.get(clave)
         if pagina is None and self.por_defecto:
             pagina = self.por_defecto(*clave)
@@ -45,7 +48,10 @@ class _PortalFalso:
         if isinstance(pagina, dict):  # respuesta cruda (p. ej. error de Elasticsearch)
             return io.BytesIO(json.dumps(pagina).encode("utf-8"))
         pagina = pagina or []
-        total = self.totales.get(cuerpo["search"], 10_000)
+        total = self.totales.get(cuerpo["search"])
+        if total is None:  # por defecto, coherente con las paginas armadas (o "muchos" si son infinitas)
+            total = 10_000 if self.por_defecto else sum(
+                len(v) for (q, _), v in self.paginas.items() if q == cuerpo["search"] and isinstance(v, list))
         crudo = {"hits": {"total": {"value": total}, "hits": pagina}}
         return io.BytesIO(json.dumps(crudo).encode("utf-8"))
 
@@ -144,7 +150,7 @@ def test_union_por_doc_id_conserva_el_orden(cliente):
     assert _ids(res) == ["A", "B", "C"], "primero la consulta original, luego lo nuevo verificado"
     assert res["variantes"] == ["21.180", "21180"]
     assert res["totales_por_variante"] == {"21.180": 2, "21180": 4}
-    assert res["total"] == 4
+    assert res["total"] == 3, "con todo leido, el total es el de la union"
     assert portal.llamadas == [("21.180", 0), ("21180", 0)]
 
 
@@ -187,7 +193,8 @@ def test_get_dictamen_no_normaliza(cliente):
 
 
 def test_auditorias_e_instructivos_aceptan_las_opciones(cliente):
-    portal = _PortalFalso({}, por_defecto=lambda q, p: [_cita(f"{q}-{p}")] if p == 0 else [])
+    portal = _PortalFalso({}, por_defecto=lambda q, p: [_cita(f"{q}-{p}")] if p == 0 else [],
+                          totales={"probidad": 1, "ley 21.180": 1, "ley 21180": 1})
     c = cliente(portal)
     assert len(c.search_auditorias("ley 21.180", limit=1)["resultados"]) == 1
     assert c.search_instructivos("probidad", todas_las_paginas=True)["barrido_completo"] is True
@@ -216,11 +223,42 @@ def test_exactamente_20_con_total_20_no_pide_otra_pagina(cliente):
 
 
 def test_exactamente_20_y_luego_vacia(cliente):
-    """Si el total informado no cuadra, la pagina vacia cierra el barrido."""
+    """Si el total informado no cuadra, la pagina vacia cierra el barrido y se avisa lo que falta."""
     portal = _PortalFalso({("probidad", 0): _pagina("a", 20)}, totales={"probidad": 999})
     res = cliente(portal).search_jurisprudencia("probidad", todas_las_paginas=True)
     assert portal.llamadas == [("probidad", 0), ("probidad", 1)]
-    assert res["barrido_completo"] is True and len(res["resultados"]) == 20
+    assert res["barrido_completo"] is False and len(res["resultados"]) == 20
+    assert "faltan 979 de 999" in res["advertencias"][0] and res["total"] == 999
+
+
+def test_orden_inestable_se_detecta(cliente):
+    """Medido en "probidad": entre paginas la API repite documentos y otros no aparecen nunca."""
+    portal = _PortalFalso({("probidad", 0): _pagina("a", 20),
+                           ("probidad", 1): _pagina("a", 2) + _pagina("b", 18),
+                           ("probidad", 2): _pagina("c", 5)}, totales={"probidad": 45})
+    res = cliente(portal).search_jurisprudencia("probidad", todas_las_paginas=True)
+    assert len(res["resultados"]) == 43
+    assert portal.llamadas[3:] == [("probidad", 0), ("probidad", 1)], "se repite la frontera, sin cache"
+    assert res["barrido_completo"] is False and res["total"] == 45
+    assert "repitió 2" in res["advertencias"][0] and "faltan 2 de 45" in res["advertencias"][0]
+
+
+def test_orden_inestable_se_recupera_repitiendo_la_frontera(cliente):
+    vueltas = {"p1": 0}
+
+    def portal_inestable(q, p):
+        if p == 0:
+            return _pagina("a", 20)
+        if p == 1:
+            vueltas["p1"] += 1  # la primera vez trae 2 repetidos de la pagina 0 en vez de b18 y b19
+            return _pagina("a", 2) + _pagina("b", 18) if vueltas["p1"] == 1 else _pagina("b", 20)
+        return _pagina("c", 5)
+
+    portal = _PortalFalso({}, por_defecto=portal_inestable, totales={"probidad": 45})
+    res = cliente(portal).search_jurisprudencia("probidad", todas_las_paginas=True)
+    assert len(res["resultados"]) == 45 == len(set(_ids(res))) == res["total"]
+    assert res["barrido_completo"] is True and "advertencias" not in res
+    assert portal.llamadas == [("probidad", 0), ("probidad", 1), ("probidad", 2), ("probidad", 0), ("probidad", 1)]
 
 
 def test_pagina_repetida_corta_el_barrido(cliente):
@@ -258,7 +296,7 @@ def test_tope_es_por_variante(cliente):
 
 def test_error_a_mitad_conserva_lo_reunido(cliente):
     portal = _PortalFalso({("probidad", 0): _pagina("a", 20),
-                           ("probidad", 1): urllib.error.URLError("portal caido")})
+                           ("probidad", 1): urllib.error.URLError("portal caido")}, totales={"probidad": 60})
     res = cliente(portal).search_jurisprudencia("probidad", todas_las_paginas=True)
     assert len(res["resultados"]) == 20
     assert res["barrido_completo"] is False and "portal caido" in res["advertencias"][0]
@@ -267,7 +305,8 @@ def test_error_a_mitad_conserva_lo_reunido(cliente):
 def test_error_json_de_la_api_no_se_lee_como_fin(cliente, tmp_path):
     """Elasticsearch responde 'Result window is too large' como JSON: no es un barrido completo."""
     portal = _PortalFalso({("probidad", 0): _pagina("a", 20),
-                           ("probidad", 1): {"error": {"type": "illegal_argument_exception"}, "status": 400}})
+                           ("probidad", 1): {"error": {"type": "illegal_argument_exception"}, "status": 400}},
+                          totales={"probidad": 60})
     res = cliente(portal).search_jurisprudencia("probidad", todas_las_paginas=True)
     assert res["barrido_completo"] is False and "error" in res["advertencias"][0]
     assert not (tmp_path / "dictamenes_probidad_p1.json").exists(), "el error no debe quedar en cache"
@@ -349,3 +388,135 @@ def test_mcp_esquema_expone_las_opciones():
         assert esquema["properties"]["todas_las_paginas"]["type"] == "boolean"
         assert esquema["properties"]["limit"]["type"] == "integer"
         assert esquema["required"] == ["query"]
+
+
+# ── 5. Barrido automatico acotado ────────────────────────────────────────────────────────────
+
+def test_por_defecto_trae_el_universo_chico_entero(cliente):
+    portal = _PortalFalso({("probidad", 0): _pagina("a", 20), ("probidad", 1): _pagina("b", 20),
+                           ("probidad", 2): _pagina("c", 5)}, totales={"probidad": 45})
+    res = cliente(portal).search_jurisprudencia("probidad", use_cache=False)
+    assert len(res["resultados"]) == 45 and res["total"] == 45 and res["barrido_completo"] is True
+    assert portal.llamadas == [("probidad", 0), ("probidad", 1), ("probidad", 2)], "la pagina 0 no se repite"
+
+
+def test_por_defecto_universo_grande_es_una_pagina_como_antes(cliente):
+    portal = _PortalFalso({("probidad", 0): _pagina("a", 20)}, totales={"probidad": 101})
+    res = cliente(portal).search_jurisprudencia("probidad")
+    assert set(res) == {"query", "source", "total", "page", "resultados"} and res["total"] == 101
+    assert portal.llamadas == [("probidad", 0)]
+
+
+def test_por_defecto_variante_grande_no_se_barre(cliente):
+    portal = _PortalFalso({}, por_defecto=lambda q, p: [_cita(f"{q}-{p}-{i}") for i in range(20)],
+                          totales={"21.180": 40, "21180": 500})
+    res = cliente(portal).search_jurisprudencia("21.180")
+    assert portal.llamadas == [("21.180", 0), ("21.180", 1), ("21180", 0)]
+    assert res["barrido_completo"] is False and res["total"] == 500
+
+
+def test_false_y_page_explicito_desactivan_el_automatico(cliente):
+    portal = _PortalFalso({}, por_defecto=lambda q, p: _pagina(f"p{p}-", 20), totales={"probidad": 45})
+    c = cliente(portal)
+    c.search_jurisprudencia("probidad", todas_las_paginas=False)
+    c.search_jurisprudencia("probidad", page=1)
+    assert portal.llamadas == [("probidad", 0), ("probidad", 1)]
+
+
+# ── 6. Backoff y registro de bloqueos ────────────────────────────────────────────────────────
+
+def _http(code, retry_after=None):
+    return urllib.error.HTTPError(cgr_connector.BASE_URL, code, "x",
+                                  {"Retry-After": retry_after} if retry_after else {}, None)
+
+
+def test_espera_backoff():
+    espera = cgr_connector._espera_backoff
+    assert [espera(i) for i in (1, 2, 3)] == [2.0, 4.0, 8.0]
+    assert espera(10) == cgr_connector._BACKOFF_TECHO
+    assert espera(1, "7") == 7.0 and espera(1, "999") == cgr_connector._BACKOFF_TECHO
+    assert espera(2, "Wed, 21 Oct 2026 07:28:00 GMT") == 4.0, "fecha HTTP: se ignora y se usa el exponencial"
+
+
+def test_429_se_reintenta_y_queda_registrado(cliente, pausas, caplog):
+    portal = _PortalFalso({("probidad", 0): [_hit("P1")]}, secuencias={("probidad", 0): [_http(429, "3")]})
+    c = cliente(portal)
+    with caplog.at_level("WARNING", logger="openlegal.cgr"):
+        res = c.search_jurisprudencia("probidad")
+    assert _ids(res) == ["P1"] and pausas == [3.0]
+    assert c.bloqueos == [{"ts": c.bloqueos[0]["ts"], "consulta": "probidad", "pagina": 0,
+                           "motivo": "HTTP 429", "intento": 1, "espera_s": 3.0}]
+    assert "HTTP 429" in caplog.text
+
+
+def test_5xx_agota_los_reintentos_y_propaga(cliente, pausas):
+    portal = _PortalFalso({}, secuencias={("probidad", 0): [_http(503)] * 4})
+    c = cliente(portal)
+    with pytest.raises(urllib.error.HTTPError):
+        c.search_jurisprudencia("probidad")
+    assert pausas == [2.0, 4.0, 8.0] and len(portal.llamadas) == 4
+    assert [b["intento"] for b in c.bloqueos] == [1, 2, 3]
+
+
+def test_5xx_agotado_con_copia_vencida(cliente, pausas, tmp_path):
+    portal = _PortalFalso({("probidad", 0): [_hit("P1")]})
+    c = cliente(portal)
+    c.search_jurisprudencia("probidad")
+    archivo = tmp_path / "dictamenes_probidad_p0.json"
+    import os
+    os.utime(archivo, (0, 0))  # copia vencida
+    portal.secuencias[("probidad", 0)] = [_http(502)] * 4
+    res = c.search_jurisprudencia("probidad")
+    assert res.get("copia_local_vencida") is True and _ids(res) == ["P1"]
+
+
+def test_4xx_no_se_reintenta(cliente, pausas):
+    portal = _PortalFalso({}, secuencias={("probidad", 0): [_http(404)]})
+    c = cliente(portal)
+    with pytest.raises(urllib.error.HTTPError):
+        c.search_jurisprudencia("probidad")
+    assert pausas == [] and c.bloqueos == []
+
+
+def test_timeout_se_reintenta_una_vez(cliente, pausas):
+    portal = _PortalFalso({}, secuencias={("probidad", 0): [TimeoutError("lento"), TimeoutError("lento")]})
+    c = cliente(portal)
+    with pytest.raises(TimeoutError):
+        c.search_jurisprudencia("probidad")
+    assert len(portal.llamadas) == 2 and pausas == [2.0]
+    assert c.bloqueos[0]["motivo"] == "TimeoutError"
+
+
+def test_bloqueo_a_mitad_baja_el_ritmo(cliente, pausas):
+    portal = _PortalFalso({("probidad", 0): _pagina("a", 20), ("probidad", 1): _pagina("b", 20),
+                           ("probidad", 2): _pagina("c", 3)},
+                          secuencias={("probidad", 1): [_http(429)]})
+    res = cliente(portal).search_jurisprudencia("probidad", todas_las_paginas=True)
+    pausa = cgr_connector._PAUSA_ENTRE_PAGINAS
+    assert pausas == [pausa, 2.0, pausa * 2], "pausa, backoff y luego la pausa duplicada"
+    assert len(res["resultados"]) == 43 and res["barrido_completo"] is True
+    assert res["reintentos"][0]["motivo"] == "HTTP 429" and res["reintentos"][0]["pagina"] == 1
+
+
+def test_pausa_adaptativa_tiene_techo(cliente, pausas):
+    fallas = {("probidad", p): [_http(429)] for p in range(1, 8)}
+    portal = _PortalFalso({}, por_defecto=lambda q, p: _pagina(f"p{p}-", 20), secuencias=fallas)
+    cliente(portal).search_jurisprudencia("probidad", todas_las_paginas=True, max_paginas=8)
+    entre_paginas = [x for x in pausas if x != 2.0]
+    assert max(entre_paginas) == cgr_connector._PAUSA_MAXIMA
+
+
+def test_registro_de_bloqueos_acotado(cliente, pausas):
+    c = cliente(_PortalFalso({}))
+    for i in range(cgr_connector._MAX_REGISTRO_BLOQUEOS + 30):
+        c._registrar_bloqueo("q", i, "HTTP 429", 1, 2.0)
+    assert len(c.bloqueos) == cgr_connector._MAX_REGISTRO_BLOQUEOS
+    assert c.bloqueos[-1]["pagina"] == cgr_connector._MAX_REGISTRO_BLOQUEOS + 29
+
+
+def test_mcp_pasa_false_explicito(monkeypatch):
+    import mcp_server
+    falso = _CGRRegistrador()
+    monkeypatch.setattr(mcp_server, "cgr", falso)
+    mcp_server.handle_tool_call("cgr_search_jurisprudencia", {"query": "probidad", "todas_las_paginas": False})
+    assert falso.kwargs == [{"todas_las_paginas": False}]

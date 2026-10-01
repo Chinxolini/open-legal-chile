@@ -96,7 +96,7 @@ TOOLS = [
             "type": "object",
             "properties": {
                 "query": {"type": "string", "description": "Término de búsqueda jurídica (ej. 'confianza legitima contrata', 'probidad', 'ley 21.180'). Los números de ley se consultan con y sin punto de miles."},
-                "todas_las_paginas": {"type": "boolean", "description": "Recorre todas las páginas de la CGR (20 por página, hasta 10 por variante) en vez de solo la primera. Más lento."},
+                "todas_las_paginas": {"type": "boolean", "description": "Por defecto se trae el universo completo si no pasa de 100 documentos y, si pasa, la primera página (20). true recorre hasta 10 páginas por variante (más lento); false pide una sola página."},
                 "limit": {"type": "integer", "description": "Máximo de documentos a reunir (opcional)"}
             },
             "required": ["query"]
@@ -109,7 +109,7 @@ TOOLS = [
             "type": "object",
             "properties": {
                 "query": {"type": "string", "description": "Entidad o materia auditada (ej. 'Municipalidad de Santiago', 'Hospital')"},
-                "todas_las_paginas": {"type": "boolean", "description": "Recorre todas las páginas de la CGR (20 por página, hasta 10 por variante) en vez de solo la primera. Más lento."},
+                "todas_las_paginas": {"type": "boolean", "description": "Por defecto se trae el universo completo si no pasa de 100 documentos y, si pasa, la primera página (20). true recorre hasta 10 páginas por variante (más lento); false pide una sola página."},
                 "limit": {"type": "integer", "description": "Máximo de documentos a reunir (opcional)"}
             },
             "required": ["query"]
@@ -359,8 +359,8 @@ TOOLS = [
 def _opciones_cgr(args: dict) -> dict:
     """Solo las opciones de barrido que vinieron: sin ellas la llamada al conector es la de siempre."""
     opciones: dict = {}
-    if args.get("todas_las_paginas"):
-        opciones["todas_las_paginas"] = True
+    if args.get("todas_las_paginas") is not None:
+        opciones["todas_las_paginas"] = bool(args["todas_las_paginas"])
     if args.get("limit"):
         opciones["limit"] = int(args["limit"])
     return opciones

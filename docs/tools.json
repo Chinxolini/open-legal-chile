@@ -151,7 +151,7 @@
         },
         "todas_las_paginas": {
           "type": "boolean",
-          "description": "Recorre todas las páginas de la CGR (20 por página, hasta 10 por variante) en vez de solo la primera. Más lento."
+          "description": "Por defecto se trae el universo completo si no pasa de 100 documentos y, si pasa, la primera página (20). true recorre hasta 10 páginas por variante (más lento); false pide una sola página."
         },
         "limit": {
           "type": "integer",
@@ -175,7 +175,7 @@
         },
         "todas_las_paginas": {
           "type": "boolean",
-          "description": "Recorre todas las páginas de la CGR (20 por página, hasta 10 por variante) en vez de solo la primera. Más lento."
+          "description": "Por defecto se trae el universo completo si no pasa de 100 documentos y, si pasa, la primera página (20). true recorre hasta 10 páginas por variante (más lento); false pide una sola página."
         },
         "limit": {
           "type": "integer",
