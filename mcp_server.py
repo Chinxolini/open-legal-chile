@@ -217,6 +217,7 @@ ORDEN_ORIGEN: List[str] = [
     "sii_buscar_resoluciones_y_oficios",
     "sii_oficios_por_anio",
     "sii_descargar_oficio",
+    "sii_leer_documento",
     "sii_actos_regionales",
     "sii_convenios_internacionales",
     "sii_jurisprudencia_judicial",

@@ -167,11 +167,12 @@ TOOLS = [
     },
     {
         "name": "sii_search_circulares",
-        "description": "Busca circulares e instrucciones oficiales del Director del Servicio de Impuestos Internos (SII) (2020-2026).",
+        "description": "Busca circulares e instrucciones oficiales del Director del Servicio de Impuestos Internos (SII) por número o por la materia que publica el índice oficial. Para leer el texto completo, usar sii_leer_documento.",
         "inputSchema": {
             "type": "object",
             "properties": {
-                "query": {"type": "string", "description": "Materia tributaria o año (ej. 'iva servicios', 'gasto tributario', '2024')"}
+                "query": {"type": "string", "description": "Materia tributaria, número o año (ej. 'iva servicios', '21.420', '2024'). No distingue tildes, plural ni orden de las palabras"},
+                "anios": {"type": "array", "description": "Años a consultar (por defecto, los últimos siete)", "items": {"type": "integer"}}
             },
             "required": ["query"]
         }
@@ -183,7 +184,7 @@ TOOLS = [
             "type": "object",
             "properties": {
                 "query": {"type": "string", "description": "Término de búsqueda tributaria o número de resolución/oficio"},
-                "anios": {"type": "array", "description": "Años a consultar (por defecto 2023 a 2026)", "items": {"type": "integer"}}
+                "anios": {"type": "array", "description": "Años a consultar (por defecto, los últimos siete)", "items": {"type": "integer"}}
             },
             "required": ["query"]
         }
@@ -207,9 +208,24 @@ TOOLS = [
                 "numero": {"type": "string", "description": "Número del oficio tal como aparece en el listado (p. ej. 2407 o 0358)"},
                 "fecha": {"type": "string", "description": "Fecha de publicación del oficio, formato dd/mm/aaaa"},
                 "anio": {"type": "integer", "description": "Año del índice a consultar (por defecto, el año en curso)"},
-                "destino": {"type": "string", "description": "Ruta donde guardar el PDF (opcional: si se omite, sólo se informa el tamaño descargado)"}
+                "destino": {"type": "string", "description": "Ruta donde guardar el PDF (opcional: si se omite, queda en la caché y se informa la ruta)"}
             },
             "required": ["numero", "fecha"]
+        }
+    },
+    {
+        "name": "sii_leer_documento",
+        "description": "Devuelve el texto íntegro de una circular, resolución exenta u oficio del SII, extraído del PDF oficial (queda guardado en la caché junto a un .txt). Úsalo para citar: la materia del índice es sólo un resumen.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "tipo": {"type": "string", "enum": ["circular", "resolucion", "oficio"], "description": "Clase de documento"},
+                "numero": {"type": "string", "description": "Número del documento (p. ej. 50, 115 o 1873)"},
+                "anio": {"type": "integer", "description": "Año de publicación (por defecto, el año en curso)"},
+                "fecha": {"type": "string", "description": "Fecha dd/mm/aaaa; necesaria si en ese año hay dos oficios con el mismo número (Renta, IVA y Otras normas numeran por separado)"},
+                "max_caracteres": {"type": "integer", "description": "Tope de caracteres del texto devuelto (por defecto 60000; el .txt guarda el texto completo)"}
+            },
+            "required": ["tipo", "numero"]
         }
     },
     {
@@ -428,7 +444,14 @@ def despachar(name: str, args: dict) -> Any:
             return {"error": "El parámetro 'query' es obligatorio."}
         return cmf.search_sanciones(q)
     elif name == "sii_search_circulares":
-        return sii.search_circulares(args.get("query", ""))
+        return sii.search_circulares(args.get("query", ""), args.get("anios"))
+    elif name == "sii_leer_documento":
+        tipo = str(args.get("tipo") or "").strip()
+        numero = str(args.get("numero") or "").strip()
+        if not tipo or not numero:
+            return {"error": "Los parámetros 'tipo' y 'numero' son obligatorios."}
+        return sii.leer_documento(tipo, numero, args.get("anio"), args.get("fecha"),
+                                  int(args.get("max_caracteres") or 60000))
     elif name == "sii_buscar_resoluciones_y_oficios":
         q = args.get("query")
         if not q:

@@ -114,7 +114,7 @@ No hace falta nombrar una herramienta ni escribir un comando: se pide como se le
 | «Es un caso ambiental» · «Mirá la sanción de la SMA» · «¿Qué dijo el Tribunal Ambiental?» | Se llama el módulo `ambiental_consulta_maestra`: sentencias TA, anuarios, boletines, biblioteca ambiental y doctrina, con texto literal |
 
 El agente **debe** usar `caso_analizar` ante esos pedidos, aunque la persona no nombre ninguna
-herramienta: así el trabajo no depende de que el modelo elija bien entre 87 herramientas. Y cuando
+herramienta: así el trabajo no depende de que el modelo elija bien entre 88 herramientas. Y cuando
 la mesa dice que falta algo (el Rol/RIT, las fechas, el RUT), eso se le pide a la persona **antes**
 de ejecutar: no se completa por deducción.
 
